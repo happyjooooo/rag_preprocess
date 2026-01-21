@@ -1,0 +1,23 @@
+# RAG PDF Processing Pipeline - Requirements
+# Python 3.12 recommended
+
+# PDF Processing
+pdfservices-sdk==4.1.0    # Adobe PDF extraction
+PyMuPDF==1.25.4           # PDF screenshots
+pillow==11.1.0            # Image processing
+
+# AI Services (Vertex AI for OCR)
+google-cloud-aiplatform==1.71.1
+vertexai==1.71.1
+
+# Multiprocessing & Progress
+tqdm==4.67.1              # Progress bars
+psutil==5.9.8             # System monitoring
+
+# Data Processing
+numpy>=1.26.0,<2.0
+pandas==2.1.3
+
+# Utilities
+python-dotenv==1.0.1
+

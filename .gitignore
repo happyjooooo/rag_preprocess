@@ -1,0 +1,29 @@
+# Environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Credentials (NEVER commit these!)
+.env
+config/.env
+*.json
+!*example*.json
+pdfservices-api-credentials.json
+vertex-ai-key.json
+
+# Output files
+*.zip
+output/
+test_output/
+processed_output*/
+raw_json_cache*/
+ocr_input_images*/
+logs/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
