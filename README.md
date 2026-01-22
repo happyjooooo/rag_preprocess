@@ -39,11 +39,20 @@ nano config/.env
 
 ### 3. Process a Single PDF
 
-```python
-from src.pdf_processor_organized import process_pdf_complete
+```bash
+python run_single.py "path/to/your.pdf"
+```
 
-output_path = process_pdf_complete("path/to/your.pdf", "output_folder")
-print(f"Processed: {output_path}")
+Output will be saved to `output/` folder by default.
+
+**With custom output directory:**
+```bash
+python run_single.py "path/to/your.pdf" my_output_folder
+```
+
+**Example:**
+```bash
+python run_single.py "/Users/john/documents/my_guideline.pdf"
 ```
 
 ### 4. Batch Processing
@@ -85,12 +94,16 @@ Each processed PDF produces a JSON file with entries like:
 
 ```
 rag_pipeline_clean/
+├── run_single.py                     # Process single PDF (command line)
+├── run_batch.py                      # Batch processing (command line)
 ├── src/
-│   ├── pdf_processor_organized.py   # Main processor (Phase 1 + 2)
-│   └── phase2_multiprocessing_WORKING.py  # Batch processing
+│   ├── pdf_processor_organized.py    # Main processor (Phase 1 + 2)
+│   └── phase2_multiprocessing_WORKING.py  # Multiprocessing wrapper
 ├── config/
+│   ├── .env                          # Your credentials (not in git)
 │   ├── env.example                   # Credential template
 │   └── pdfservices-api-credentials.json.example
+├── output/                           # Processed JSON files
 ├── requirements.txt
 └── README.md
 ```
