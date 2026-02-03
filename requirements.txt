@@ -9,6 +9,7 @@ pillow==11.1.0            # Image processing
 # AI Services (Vertex AI for OCR)
 google-cloud-aiplatform==1.71.1
 vertexai==1.71.1
+google-generativeai>=0.3.0  # Free Gemini API for classification
 
 # Multiprocessing & Progress
 tqdm==4.67.1              # Progress bars
