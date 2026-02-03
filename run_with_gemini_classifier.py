@@ -68,7 +68,7 @@ def classify_with_gemini(image: Image.Image, doc_type: str = 'figure') -> tuple[
     try:
         # Configure Gemini
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')  # Fast and cheap
+        model = genai.GenerativeModel('gemini-2.0-flash')  # Fast and cheap
         
         # Simple classification prompt
         prompt = f"""Look at this {doc_type} from a medical/clinical guideline PDF.

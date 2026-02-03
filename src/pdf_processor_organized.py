@@ -490,21 +490,54 @@ class JSONFormatter:
 
 class OCRProcessor:
     """Handles image capture and OCR processing for tables and figures using Vertex AI."""
-    
+
     def __init__(self, pdf_path: str, zoom: int = 3):
         self.pdf_path = pdf_path
         self.zoom = zoom
         # Use Vertex AI with Gemini 2.5 Flash
         self.model = GenerativeModel('gemini-2.5-flash')
+        # Keep PDF document open for efficiency (opened lazily)
+        self._pdf_doc = None
+        # Exponential backoff state
+        self._consecutive_errors = 0
+        self._base_delay = 0.1  # Start with 100ms delay
+        self._max_delay = 30.0  # Cap at 30 seconds
+
+    def _get_pdf_doc(self):
+        """Lazily open and cache the PDF document."""
+        if self._pdf_doc is None:
+            self._pdf_doc = fitz.open(self.pdf_path)
+        return self._pdf_doc
+
+    def close(self):
+        """Close the PDF document when done."""
+        if self._pdf_doc is not None:
+            self._pdf_doc.close()
+            self._pdf_doc = None
+
+    def _get_backoff_delay(self) -> float:
+        """Calculate exponential backoff delay based on consecutive errors."""
+        if self._consecutive_errors == 0:
+            return self._base_delay
+        delay = self._base_delay * (2 ** self._consecutive_errors)
+        return min(delay, self._max_delay)
+
+    def _record_success(self):
+        """Record successful API call - reset backoff."""
+        self._consecutive_errors = 0
+
+    def _record_error(self):
+        """Record failed API call - increase backoff."""
+        self._consecutive_errors += 1
     
     def capture_screenshot(self, page_num: int, coordinates: List[float]) -> Optional[Image.Image]:
         """
         Capture a screenshot of a PDF region.
-        
+
         Args:
             page_num: Page number (0-indexed for PyMuPDF)
             coordinates: [x1, y1, x2, y2] coordinates
-            
+
         Returns:
             PIL Image of the region, or None if capture fails
         """
@@ -512,9 +545,9 @@ class OCRProcessor:
             # Validate inputs
             if not coordinates or len(coordinates) != 4:
                 raise ValueError(f"Invalid coordinates: {coordinates}")
-            
-            # Open PDF and get page
-            doc = fitz.open(self.pdf_path)
+
+            # Use cached PDF document for efficiency
+            doc = self._get_pdf_doc()
             page = doc.load_page(page_num)
             
             # Convert coordinates
@@ -539,9 +572,8 @@ class OCRProcessor:
             top = min(y1_px, y2_px)
             bottom = max(y1_px, y2_px)
             
-            # Crop and return
+            # Crop and return (PDF doc stays open for efficiency)
             cropped_img = img.crop((left, top, right, bottom))
-            doc.close()
             return cropped_img
             
         except Exception as e:
@@ -610,7 +642,12 @@ CONFIDENCE: [score between 0.0 and 1.0]"""
 
             # Process with Vertex AI Gemini 2.5 Flash
             response = self.model.generate_content([prompt, Part.from_data(image_bytes, mime_type="image/png")])
-            time.sleep(1)  # To avoid rate-limiting issues
+
+            # Record success and apply minimal delay with exponential backoff
+            self._record_success()
+            delay = self._get_backoff_delay()
+            if delay > 0:
+                time.sleep(delay)
             
             # Parse response to extract summary and confidence
             response_text = response.text
@@ -635,18 +672,25 @@ CONFIDENCE: [score between 0.0 and 1.0]"""
             
         except Exception as e:
             logging.error(f"OCR processing failed: {e}")
-            
+
+            # Record error for exponential backoff
+            self._record_error()
+
             # Re-raise quota errors to stop the batch
             error_msg = str(e).lower()
             quota_indicators = [
                 'quota', 'rate limit', 'too many requests', 'quota exceeded',
                 '429', 'you exceeded your current quota'
             ]
-            
+
             if any(indicator in error_msg for indicator in quota_indicators):
+                # Apply longer backoff before raising
+                backoff_delay = self._get_backoff_delay()
+                logging.warning(f"⏳ Rate limit hit, backing off for {backoff_delay:.1f}s before stopping...")
+                time.sleep(backoff_delay)
                 logging.error(f"🛑 QUOTA ERROR in OCR - re-raising to stop batch: {e}")
                 raise Exception(f"QUOTA_ERROR_DETECTED: {e}")
-            
+
             return f"[OCR processing error: {str(e)}]", 0.0
     
     def process_single_element(self, entry: Dict) -> None:
@@ -781,16 +825,82 @@ CONFIDENCE: [score between 0.0 and 1.0]"""
 
 class PDFProcessor:
     """Main orchestrator class for the PDF processing pipeline."""
-    
-    def __init__(self, pdf_path: str, output_dir: str = "processed_output"):
+
+    def __init__(self, pdf_path: str, output_dir: str = "processed_output",
+                 use_classification: bool = True):
         self.pdf_path = pdf_path
         self.output_dir = output_dir
         self.extractor = AdobePDFExtractor()
         self.formatter = JSONFormatter()
         self.ocr_processor = OCRProcessor(pdf_path)
-        
+        self.use_classification = use_classification
+
+        # Classification data (loaded if available)
+        self.classification_data = {}
+        self.screenshots_dir = None
+        if use_classification:
+            self._load_classification_data()
+
         # Ensure output directory exists
         os.makedirs(output_dir, exist_ok=True)
+
+    def _load_classification_data(self):
+        """Load classification data from Gemini classifier output if available."""
+        pdf_name = os.path.splitext(os.path.basename(self.pdf_path))[0]
+        screenshots_base = Path("screenshots") / pdf_name
+
+        if not screenshots_base.exists():
+            logging.info("No classification data found - will process all images")
+            return
+
+        important_dir = screenshots_base / "important"
+        skipped_dir = screenshots_base / "skipped"
+
+        if important_dir.exists() and skipped_dir.exists():
+            self.screenshots_dir = screenshots_base
+            # Build lookup by (doc_type, page) -> screenshot_path
+            for img_path in important_dir.glob("*.png"):
+                key = self._parse_screenshot_name(img_path.name)
+                if key:
+                    self.classification_data[key] = {
+                        'classification': 'informative',
+                        'screenshot_path': str(img_path)
+                    }
+
+            for img_path in skipped_dir.glob("*.png"):
+                # Skipped files have format: SKIP_{type}_{num}_page{page}_{reason}.png
+                key = self._parse_screenshot_name(img_path.name, is_skipped=True)
+                if key:
+                    self.classification_data[key] = {
+                        'classification': 'decorative',
+                        'screenshot_path': str(img_path)
+                    }
+
+            logging.info(f"Loaded classification data: {len(self.classification_data)} items "
+                        f"({sum(1 for v in self.classification_data.values() if v['classification'] == 'informative')} informative, "
+                        f"{sum(1 for v in self.classification_data.values() if v['classification'] == 'decorative')} decorative)")
+
+    def _parse_screenshot_name(self, filename: str, is_skipped: bool = False) -> Optional[tuple]:
+        """Parse screenshot filename to extract (doc_type, page) key."""
+        # Format: figure_1_page23_20260203152312.png or SKIP_figure_1_page23_reason.png
+        try:
+            parts = filename.replace('.png', '').split('_')
+            if is_skipped and parts[0] == 'SKIP':
+                parts = parts[1:]  # Remove SKIP prefix
+
+            doc_type = parts[0]  # 'figure' or 'table'
+            # Find page number
+            for part in parts:
+                if part.startswith('page'):
+                    page = int(part.replace('page', '')) - 1  # Convert to 0-indexed
+                    return (doc_type, page)
+        except (IndexError, ValueError):
+            pass
+        return None
+
+    def _get_classification(self, doc_type: str, page: int) -> Optional[dict]:
+        """Get classification data for a specific element."""
+        return self.classification_data.get((doc_type, page))
 
     # --- RAW JSON CACHE UTILS ---
     RAW_JSON_CACHE_DIR = "raw_json_cache_10pdfs/raw_extractions"
@@ -838,7 +948,10 @@ class PDFProcessor:
         # Step 3: Process tables and figures with OCR
         logging.info("Step 3: Processing tables and figures with OCR...")
         self._process_tables_and_figures(formatted_json)
-        
+
+        # Clean up OCR processor (closes cached PDF document)
+        self.ocr_processor.close()
+
         # Step 4: Save final output
         logging.info("Step 4: Saving processed output...")
         output_path = self._save_output(formatted_json, pdf_filename)
@@ -859,7 +972,11 @@ class PDFProcessor:
         """Process tables and figures with OCR, merging consecutive tables."""
         # STEP 1: First merge text entries under same subheading across pages
         self._merge_text_across_pages(formatted_json)
-        
+
+        # Stats for logging
+        ocr_count = 0
+        skip_count = 0
+
         # STEP 2: Then process tables and figures with OCR (existing logic)
         i = 0
         while i < len(formatted_json):
@@ -872,35 +989,106 @@ class PDFProcessor:
                 current_page = meta.get('page', 1)
                 group = [entry]
                 j = i + 1
-                
+
                 # Collect consecutive tables on subsequent pages
                 while j < len(formatted_json):
                     next_entry = formatted_json[j]
                     next_meta = next_entry.get('meta', {})
-                    if (next_meta.get('Doc_type') == 'table' and 
+                    if (next_meta.get('Doc_type') == 'table' and
                         next_meta.get('page', 1) == current_page + 1):
                         group.append(next_entry)
                         current_page = next_meta.get('page', 1)
                         j += 1
                     else:
                         break
-                
+
                 if len(group) > 1:
-                    # Process merged table group
+                    # Process merged table group (tables are usually informative)
                     merged_entry = self.ocr_processor.process_merged_table_group(group)
                     formatted_json[i:j] = [merged_entry]
+                    ocr_count += 1
                     i += 1
                 else:
-                    # Process single table
-                    self.ocr_processor.process_single_element(entry)
+                    # Check classification for single table
+                    classification = self._get_classification('table', meta.get('page', 0))
+                    if classification and classification['classification'] == 'decorative':
+                        self._mark_as_skipped(entry, "Decorative table - skipped by classifier")
+                        skip_count += 1
+                    elif classification and classification['classification'] == 'informative':
+                        # Use pre-captured screenshot
+                        self._process_with_existing_screenshot(entry, classification['screenshot_path'])
+                        ocr_count += 1
+                    else:
+                        # No classification - process normally
+                        self.ocr_processor.process_single_element(entry)
+                        ocr_count += 1
                     i += 1
 
             elif doc_type == 'figure':
-                # Process figures individually
-                self.ocr_processor.process_single_element(entry)
+                # Check classification for figure
+                classification = self._get_classification('figure', meta.get('page', 0))
+                if classification and classification['classification'] == 'decorative':
+                    self._mark_as_skipped(entry, "Decorative figure - skipped by classifier")
+                    skip_count += 1
+                elif classification and classification['classification'] == 'informative':
+                    # Use pre-captured screenshot
+                    self._process_with_existing_screenshot(entry, classification['screenshot_path'])
+                    ocr_count += 1
+                else:
+                    # No classification - process normally
+                    self.ocr_processor.process_single_element(entry)
+                    ocr_count += 1
                 i += 1
             else:
                 i += 1
+
+        logging.info(f"OCR processing complete: {ocr_count} processed, {skip_count} skipped (decorative)")
+
+    def _mark_as_skipped(self, entry: Dict, reason: str) -> None:
+        """Mark an entry as skipped (decorative)."""
+        entry['content'] = f"{entry['content']}\n\n[{reason}]"
+        meta = entry.get('meta', {})
+        meta['classification'] = 'decorative'
+        meta['ocr_status'] = 'skipped'
+        meta['ocr_confidence'] = 0.0
+
+    def _process_with_existing_screenshot(self, entry: Dict, screenshot_path: str) -> None:
+        """Process an entry using an existing screenshot instead of capturing."""
+        try:
+            if not os.path.exists(screenshot_path):
+                logging.warning(f"Screenshot not found: {screenshot_path}, falling back to capture")
+                self.ocr_processor.process_single_element(entry)
+                return
+
+            # Load existing screenshot
+            img = Image.open(screenshot_path)
+            img = img.convert('L')  # Convert to grayscale
+
+            meta = entry.get('meta', {})
+            doc_type = meta.get('Doc_type', 'figure')
+
+            # Prepare context for OCR
+            doc_name = os.path.basename(self.pdf_path)
+            headings = meta.get('headings', {})
+            headings_info = {
+                'current_heading': headings.get(1, 'None'),
+                'current_subheading': headings.get(2, 'None'),
+                'page_number': meta.get('page', 'Unknown')
+            }
+
+            # Run OCR on existing image
+            summary, confidence = self.ocr_processor.process_with_ocr(img, doc_type, doc_name, headings_info)
+            entry['content'] = f"{entry['content']}\n\nSUMMARY: {summary}"
+            meta['ocr_confidence'] = confidence
+            meta['classification'] = 'informative'
+            meta['ocr_status'] = 'completed'
+            meta['screenshot_source'] = screenshot_path
+            logging.info(f"OCR from existing screenshot: {os.path.basename(screenshot_path)} (conf: {confidence:.2f})")
+
+        except Exception as e:
+            logging.error(f"Error processing existing screenshot {screenshot_path}: {e}")
+            entry['content'] = f"{entry['content']}\n\n[OCR error: {str(e)[:100]}]"
+            meta['ocr_confidence'] = 0.0
     
     def _merge_text_across_pages(self, formatted_json: List[Dict]) -> None:
         """Merge text entries under the same subheading when they span across pages."""
